@@ -1,14 +1,10 @@
 # -*- coding: utf-8 -*-
-# Stock Signals PRO – Enhanced Multi-Source Analysis (Streamlit-ready)
+# Stock Signals PRO – Enhanced Multi-Source Analysis (Streamlit-ready, 15m cache)
 
-import math
-import re
 import json
 import datetime as dt
 from pathlib import Path
 from typing import List, Dict, Optional, Tuple
-import os
-import time
 
 import numpy as np
 import pandas as pd
@@ -20,19 +16,13 @@ import streamlit as st
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
-import plotly.express as px
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# Optional extras (safe fallbacks)
+# Optional deps (safe fallbacks)
 try:
     from textblob import TextBlob
 except Exception:
     TextBlob = None
-
-try:
-    from bs4 import BeautifulSoup
-except Exception:
-    BeautifulSoup = None
 
 try:
     import pandas_market_calendars as mcal
@@ -47,9 +37,9 @@ except Exception:
 APP_TITLE = "Stock Signals PRO – Enhanced Multi-Source Analysis"
 
 # ---------- CONFIG ----------
-CACHE_TTL = 15 * 60         # 15 minutes – controls st.cache_data TTL
-EARNINGS_WINDOW_DAYS = 7    # show earnings due within X days
-MAX_WORKERS = 8             # parallel requests
+CACHE_TTL = 15 * 60         # 15 minutes cache for all data calls
+EARNINGS_WINDOW_DAYS = 7    # show earnings date if within the next X days
+MAX_WORKERS = 8             # parallel scanning threads
 
 WATCHLIST_FILE = Path.home() / "stock_signals_watchlist.json"
 SETTINGS_FILE  = Path.home() / "stock_signals_settings.json"
@@ -144,11 +134,9 @@ def is_market_open(profile_key: str) -> bool:
 @st.cache_data(ttl=CACHE_TTL, show_spinner=False)
 def get_price_history(ticker: str, days: int, interval: str = "1d") -> pd.DataFrame:
     if interval == "30m":
-        period = "60d"  # Yahoo limit for 30m
-        interv = "30m"
+        period, interv = "60d", "30m"
     else:
-        period = f"{days}d"
-        interv = "1d"
+        period, interv = f"{days}d", "1d"
     df = yf.download(ticker, period=period, interval=interv, auto_adjust=True, progress=False, threads=False)
     if df is None or df.empty:
         return pd.DataFrame()
@@ -162,13 +150,11 @@ def get_info_fast(ticker: str) -> Dict:
     out = {}
     try:
         tk = yf.Ticker(ticker)
-        # fast_info where possible
         try:
             fi = getattr(tk, "fast_info", None) or {}
         except Exception:
             fi = {}
         out["beta"] = fi.get("beta", None)
-        # legacy info (can fail)
         try:
             inf = tk.info or {}
         except Exception:
@@ -211,7 +197,7 @@ def get_multi_source_news(ticker: str, days: int = 7) -> List[Dict]:
 
 @st.cache_data(ttl=CACHE_TTL, show_spinner=False)
 def get_upcoming_earnings(symbol: str) -> Optional[dt.date]:
-    """Fetch next earnings date via Yahoo quoteSummary (more reliable)."""
+    """Next earnings date via Yahoo quoteSummary."""
     try:
         url = f"https://query2.finance.yahoo.com/v10/finance/quoteSummary/{symbol}"
         params = {"modules": "calendarEvents"}
@@ -264,16 +250,14 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df["SMA50"] = c.rolling(50).mean()
     df["SMA200"] = c.rolling(200).mean()
     df["RSI14"] = rsi(c, 14)
-    macd_line, macd_sig, macd_hist = macd(c, 12, 26, 9)
-    df["MACD"] = macd_line; df["MACD_SIG"] = macd_sig; df["MACD_HIST"] = macd_hist
-    u,m,l = bollinger_bands(c, 20, 2)
-    df["BB_Upper"]=u; df["BB_Middle"]=m; df["BB_Lower"]=l
+    m, s, h = macd(c, 12, 26, 9)
+    df["MACD"] = m; df["MACD_SIG"] = s; df["MACD_HIST"] = h
+    u,middle,l = bollinger_bands(c, 20, 2)
+    df["BB_Upper"]=u; df["BB_Middle"]=middle; df["BB_Lower"]=l
     df["BB_Position"] = np.where((u-l)!=0, (c - l) / (u - l) * 100, np.nan)
-    # 52w hi/low
     w = min(len(df), 252)
     df["HI52"] = c.rolling(w).max()
     df["LO52"] = c.rolling(w).min()
-    # momentum & volume
     df["Return_5d"]  = c.pct_change(5)*100
     df["Return_20d"] = c.pct_change(20)*100
     if "Volume" in df.columns:
@@ -328,10 +312,9 @@ def enhanced_signal_classification(ticker: str, df: pd.DataFrame, news: Optional
     bb_pos = row.get("BB_Position", np.nan)
 
     signals = {"technical":0, "momentum":0, "volume":0, "sentiment":0, "relative":0, "fundamental":0}
-    reasons = []
-    confs = []
+    reasons, confs = [], []
 
-    # Moving averages
+    # MAs
     if not any(pd.isna([sma20,sma50,sma200])):
         if price > sma20 > sma50 > sma200:
             signals["technical"] += 20; reasons.append("Uptrend: price > SMA20 > SMA50 > SMA200"); confs.append(0.9)
@@ -402,7 +385,7 @@ def enhanced_signal_classification(ticker: str, df: pd.DataFrame, news: Optional
         elif sc < -0.1:
             signals["sentiment"] -= int(5*conf); reasons.append(f"Negative news ({sc:+.2f})"); confs.append(conf*0.7)
 
-    # Fundamentals (very soft)
+    # Fundamentals (soft)
     pe = info.get("forwardPE") or info.get("trailingPE")
     if pe:
         try:
@@ -413,11 +396,9 @@ def enhanced_signal_classification(ticker: str, df: pd.DataFrame, news: Optional
         except Exception:
             pass
 
-    # Score & risk
     total = sum(signals.values())
     mult = {"conservative":0.7, "balanced":1.0, "aggressive":1.3}.get(risk_profile,1.0)
     adj = total * mult
-
     avg_conf = float(np.mean(confs)) if confs else 0.5
 
     if adj >= 25: label = "STRONG BUY"
@@ -428,78 +409,54 @@ def enhanced_signal_classification(ticker: str, df: pd.DataFrame, news: Optional
     elif adj <= -5:  label = "WEAK SELL"
     else: label = "HOLD"
 
-    return {
-        "ticker": ticker,
-        "signal": label,
-        "score": int(adj),
-        "confidence": min(100, int(avg_conf*100)),
-        "price": price,
-        "reasons": reasons[:8],
-    }
+    return {"ticker": ticker, "signal": label, "score": int(adj),
+            "confidence": min(100, int(avg_conf*100)), "price": price,
+            "reasons": reasons[:8]}
 
 # ---------- VISUALS ----------
 def plot_ticker(df: pd.DataFrame, ticker: str) -> go.Figure:
     fig = make_subplots(rows=3, cols=1, shared_xaxis=True,
                         vertical_spacing=0.07, row_heights=[0.6,0.2,0.2],
                         subplot_titles=[f"{ticker} Price", "RSI(14)", "MACD"])
-    # price
     if all(col in df.columns for col in ["Open","High","Low","Close"]):
         fig.add_trace(go.Candlestick(x=df.index, open=df["Open"], high=df["High"], low=df["Low"],
                                      close=df["Close"], name="Price"), row=1,col=1)
     else:
         fig.add_trace(go.Scatter(x=df.index, y=df["Close"], name="Price"), row=1,col=1)
-    # MAs
     for p in [20,50]:
         col = f"SMA{p}"
         if col in df.columns:
             fig.add_trace(go.Scatter(x=df.index, y=df[col], name=col, line=dict(width=1)), row=1,col=1)
-    # BB
     for col, nm in [("BB_Upper","BB Upper"),("BB_Lower","BB Lower")]:
         if col in df.columns:
             fig.add_trace(go.Scatter(x=df.index, y=df[col], name=nm, line=dict(width=1, dash="dash")), row=1,col=1)
-
-    # RSI
     if "RSI14" in df.columns:
         fig.add_trace(go.Scatter(x=df.index, y=df["RSI14"], name="RSI14"), row=2,col=1)
         fig.add_hline(y=70, line_dash="dash", row=2, col=1)
         fig.add_hline(y=30, line_dash="dash", row=2, col=1)
-
-    # MACD
     if {"MACD","MACD_SIG","MACD_HIST"}.issubset(df.columns):
         fig.add_trace(go.Scatter(x=df.index, y=df["MACD"], name="MACD"), row=3,col=1)
         fig.add_trace(go.Scatter(x=df.index, y=df["MACD_SIG"], name="Signal"), row=3,col=1)
         fig.add_trace(go.Bar(x=df.index, y=df["MACD_HIST"], name="Hist", opacity=0.5), row=3,col=1)
-
     fig.update_layout(height=800, xaxis_rangeslider_visible=False, template="plotly_white", showlegend=True)
     return fig
 
 # ---------- PIPELINE ----------
-def process_one(ticker: str, cfg: Dict, spy_close: pd.Series) -> Optional[Tuple[Dict, Dict]]:
+def process_one(ticker: str, cfg: Dict, spy_close: pd.Series):
     try:
         df = get_price_history(ticker, cfg["lookback_days"], cfg["interval"])
         if df.empty:
             return None
         df = compute_indicators(df)
-
-        # Relative strength vs SPY (20d)
         rs20 = compute_relative_strength20(df["Close"], spy_close)
-
-        # Info & earnings
         info = get_info_fast(ticker)
         earn_date = get_upcoming_earnings(ticker)
-
-        # News & sentiment
         news_sent = None
         if cfg["use_news"]:
             news = get_multi_source_news(ticker, cfg["news_days"])
             news_sent = analyze_sentiment(news)
+        res = enhanced_signal_classification(ticker, df, news_sent, cfg["risk_profile"], rs20, info, earn_date)
 
-        # Classification
-        res = enhanced_signal_classification(
-            ticker, df, news_sent, cfg["risk_profile"], rs20, info, earn_date
-        )
-
-        # Table row
         r = df.iloc[-1]
         earn_col = "—"
         if earn_date:
@@ -549,10 +506,8 @@ def main():
     with st.sidebar:
         st.header("Configuration")
         market_key = st.selectbox("Market Profile:", list(MARKETS.keys()), index=0)
-        mi = MARKETS[market_key]
-        tz = pytz.timezone(mi["tz"])
-        open_now = is_market_open(market_key)
-        st.markdown(f"**Market Status:** {'OPEN' if open_now else 'CLOSED'}")
+        tz = pytz.timezone(MARKETS[market_key]["tz"])
+        st.markdown(f"**Market Status:** {'OPEN' if is_market_open(market_key) else 'CLOSED'}")
         st.markdown(f"**Local Time:** {dt.datetime.now(tz).strftime('%H:%M:%S %Z')}")
 
         st.subheader("Analysis")
@@ -565,16 +520,25 @@ def main():
         use_news = st.checkbox("Enable News Sentiment", value=settings.get("use_news", True))
         news_days = st.slider("News Lookback (days):", 1, 30, settings.get("news_days",7))
 
-        st.subheader("Indicators")
-        st.multiselect("Active Indicators (info)", ["RSI","MACD","Bollinger"],
-                       default=settings.get("indicators",["RSI","MACD","Bollinger"]))
+        # ---- Indicators (sanitized defaults to avoid crash) ----
+        AVAILABLE_INDICATORS = ["RSI", "MACD", "Bollinger"]
+        saved_inds = settings.get("indicators", AVAILABLE_INDICATORS)
+        clean_default = [x for x in saved_inds if x in AVAILABLE_INDICATORS] or AVAILABLE_INDICATORS
+        selected_indicators = st.multiselect(
+            "Active Indicators (info)",
+            AVAILABLE_INDICATORS,
+            default=clean_default,
+            key="indicators_ms",
+        )
+        if not selected_indicators:
+            selected_indicators = AVAILABLE_INDICATORS
 
         st.subheader("Extras")
         auto_refresh = st.checkbox("Auto refresh every 15 min", value=settings.get("auto_refresh", True))
         if auto_refresh and st_autorefresh:
             st_autorefresh(interval=CACHE_TTL*1000, key="auto15m")
 
-        # Watchlist controls
+        # Watchlist
         st.subheader("Watchlist (persistent)")
         wl = load_watchlist()
         st.caption(f"Saved: {len(wl)}  →  {', '.join(wl[:8]) + (' ...' if len(wl)>8 else '')}")
@@ -589,21 +553,19 @@ def main():
         if st.button("Remove"):
             wl2 = [x for x in wl if x not in rem]; save_watchlist(wl2); st.experimental_rerun()
 
-    # Save settings snapshot
+    # Save settings snapshot (use selected_indicators)
     save_settings({
         "risk_profile": risk_profile, "lookback_days": lookback_days,
         "interval": interval, "use_news": use_news, "news_days": news_days,
-        "indicators": ["RSI","MACD","Bollinger"], "auto_refresh": auto_refresh
+        "indicators": selected_indicators, "auto_refresh": auto_refresh
     })
 
     if not wl:
         st.warning("No tickers in watchlist. Add some from the sidebar.")
         return
 
-    cfg = {
-        "risk_profile": risk_profile, "lookback_days": lookback_days,
-        "interval": interval, "use_news": use_news, "news_days": news_days
-    }
+    cfg = {"risk_profile": risk_profile, "lookback_days": lookback_days,
+           "interval": interval, "use_news": use_news, "news_days": news_days}
 
     if st.button("Run Enhanced Analysis", type="primary"):
         with st.spinner("Scanning..."):
@@ -636,7 +598,6 @@ def main():
                 st.markdown("**Key reasons:**")
                 for i, reason in enumerate(r.get("reasons", []), 1):
                     st.write(f"{i}. {reason}")
-                # chart
                 try:
                     df_ch = get_price_history(r["ticker"], lookback_days, interval)
                     df_ch = compute_indicators(df_ch)
